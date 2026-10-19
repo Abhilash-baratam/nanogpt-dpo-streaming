@@ -1,104 +1,145 @@
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Optional
-import torch
-import torch.nn.functional as F
+
+import json
+import logging
+import os
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from model import NanoGPT
-from prepare import vocab_size, encode, decode
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------------------
-# Configuration
-# -----------------------------------------------------------------------------
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-BLOCK_SIZE = 32
-N_EMBD = 64
-N_HEAD = 4
-N_LAYER = 3
-CHECKPOINT_PATH = Path("nanogpt_dpo_aligned.pt")
+app = FastAPI(title="Gemini Question Answering App")
 
-model_instance: Optional[NanoGPT] = None
-
-# -----------------------------------------------------------------------------
-# Lifespan: Model Loader
-# -----------------------------------------------------------------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global model_instance
-    target_path = CHECKPOINT_PATH if CHECKPOINT_PATH.exists() else Path("nanogpt_base.pt")
-
-    if not target_path.exists():
-        raise FileNotFoundError("Missing checkpoint! Run train.py or dpo_train.py first.")
-
-    print(f"Loading checkpoint '{target_path}' onto {DEVICE}...")
-    model_instance = NanoGPT(
-        vocab_size=vocab_size,
-        n_embd=N_EMBD,
-        block_size=BLOCK_SIZE,
-        n_head=N_HEAD,
-        n_layer=N_LAYER
-    ).to(DEVICE)
-
-    model_instance.load_state_dict(torch.load(target_path, map_location=DEVICE))
-    model_instance.eval()
-    print("NanoGPT model successfully loaded!")
-    yield
-    model_instance = None
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
 
 
-app = FastAPI(title="NanoGPT Web App", lifespan=lifespan)
-
-# -----------------------------------------------------------------------------
-# Schemas & Sampling
-# -----------------------------------------------------------------------------
 class GenerateRequest(BaseModel):
-    prompt: str = "\nROMEO:\nWhat light "
-    max_new_tokens: int = 60
-    temperature: float = 0.7
-    top_k: int = 5
+    prompt: str = Field(min_length=1, max_length=12000)
+    max_new_tokens: int = Field(default=256, ge=1, le=2048)
+    temperature: float = Field(default=0.2, ge=0, le=2)
 
 
-@torch.no_grad()
-def sample_tokens(model: NanoGPT, prompt: str, max_new_tokens: int, temperature: float, top_k: int) -> str:
-    tokens = encode(prompt)
-    if not tokens:
-        tokens = [0]
+def get_answer(req: GenerateRequest) -> str:
+    api_key = os.getenv("GEMINI_API_KEY")
 
-    idx = torch.tensor([tokens], dtype=torch.long, device=DEVICE)
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini API key missing. Set GEMINI_API_KEY in your .env file.",
+        )
 
-    for _ in range(max_new_tokens):
-        idx_cond = idx[:, -BLOCK_SIZE:]
-        logits, _ = model(idx_cond)
-        logits = logits[:, -1, :] / max(temperature, 1e-5)
+    payload = {
+        "systemInstruction": {
+            "parts": [
+                {
+                    "text": (
+                        "Answer the user's question directly and clearly. "
+                        "Be accurate and concise. If unsure, say so instead "
+                        "of inventing an answer."
+                    )
+                }
+            ]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": req.prompt}],
+            }
+        ],
+        "generationConfig": {
+            "maxOutputTokens": req.max_new_tokens,
+            "temperature": req.temperature,
+        },
+    }
 
-        if top_k is not None:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = -float('Inf')
+    request = Request(
+        GEMINI_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "x-goog-api-key": api_key,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
 
-        probs = F.softmax(logits, dim=-1)
-        idx_next = torch.multinomial(probs, num_samples=1)
-        idx = torch.cat((idx, idx_next), dim=1)
+    try:
+        with urlopen(request, timeout=90) as response:
+            result = json.loads(response.read().decode("utf-8"))
 
-    return decode(idx[0].tolist())
+    except HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        logger.error("Gemini API HTTP %s: %s", exc.code, error_body[:1000])
+
+        if exc.code == 400:
+            detail = "Gemini rejected the request. Check the model name and request settings."
+        elif exc.code == 401 or exc.code == 403:
+            detail = (
+                "Gemini authentication failed. Check your API key, "
+                "key restrictions, and Gemini API access."
+            )
+        elif exc.code == 404:
+            detail = "Gemini model not found. Check the GEMINI_MODEL setting."
+        elif exc.code == 429:
+            detail = "Gemini quota or rate limit reached. Check your API usage and billing limits."
+        else:
+            detail = f"Gemini API request failed with HTTP {exc.code}."
+
+        raise HTTPException(status_code=502, detail=detail) from exc
+
+    except (URLError, TimeoutError) as exc:
+        logger.exception("Could not connect to Gemini")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not connect to Google Gemini. Check your internet connection.",
+        ) from exc
+
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        logger.exception("Gemini returned invalid JSON")
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini returned an invalid response.",
+        ) from exc
+
+    try:
+        candidate = result["candidates"][0]
+        parts = candidate["content"]["parts"]
+        answer = "\n".join(
+            part["text"] for part in parts if isinstance(part.get("text"), str)
+        )
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        logger.error("Unexpected Gemini response: %s", result)
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Gemini returned no usable answer. The response may have "
+                "been blocked or stopped without text."
+            ),
+        ) from exc
+
+    if not answer.strip():
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini returned an empty answer.",
+        )
+
+    return answer.strip()
 
 
-# -----------------------------------------------------------------------------
-# API Endpoints
-# -----------------------------------------------------------------------------
 @app.post("/generate")
 def generate(req: GenerateRequest):
-    if model_instance is None:
-        raise HTTPException(status_code=503, detail="Model is not loaded.")
-    output = sample_tokens(model_instance, req.prompt, req.max_new_tokens, req.temperature, req.top_k)
-    return {"generated_text": output}
+    return {"generated_text": get_answer(req)}
 
 
-# -----------------------------------------------------------------------------
-# Webpage directly built into app.py (No static folder needed)
-# -----------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def serve_home():
     return """
@@ -106,70 +147,76 @@ def serve_home():
     <html lang="en">
     <head>
       <meta charset="UTF-8">
-      <title>NanoGPT Interactive Console</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Gemini Question Answering</title>
       <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-slate-900 text-slate-100 min-h-screen flex flex-col items-center p-6">
       <div class="w-full max-w-2xl bg-slate-800 rounded-xl shadow-lg border border-slate-700 p-6 space-y-5">
-        <h1 class="text-2xl font-bold text-white">NanoGPT DPO Console</h1>
-        <p class="text-sm text-slate-400">Direct Preference Optimization Inference</p>
+        <h1 class="text-2xl font-bold text-white">Ask a Question</h1>
+        <p class="text-sm text-slate-400">Get a clear answer powered by Google Gemini.</p>
 
         <div>
-          <label class="block text-sm font-medium mb-1">Prompt</label>
-          <textarea id="prompt" rows="3" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-slate-100 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">\nROMEO:\nWhat light </textarea>
+          <label class="block text-sm font-medium mb-1" for="prompt">Your question</label>
+          <textarea id="prompt" rows="3" maxlength="12000"
+            class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-slate-100 text-sm"
+            placeholder="For example: What is the capital of Andhra Pradesh?"></textarea>
         </div>
 
-        <div class="grid grid-cols-3 gap-3">
+        <div class="grid grid-cols-2 gap-3">
           <div>
-            <label class="text-xs text-slate-400">Max Tokens</label>
-            <input id="maxTokens" type="number" value="60" class="w-full bg-slate-950 border border-slate-700 rounded p-2 text-sm">
+            <label class="text-xs text-slate-400" for="maxTokens">Maximum answer length</label>
+            <input id="maxTokens" type="number" min="1" max="2048" value="256"
+              class="w-full bg-slate-950 border border-slate-700 rounded p-2 text-sm">
           </div>
           <div>
-            <label class="text-xs text-slate-400">Temperature</label>
-            <input id="temp" type="number" step="0.1" value="0.7" class="w-full bg-slate-950 border border-slate-700 rounded p-2 text-sm">
-          </div>
-          <div>
-            <label class="text-xs text-slate-400">Top-K</label>
-            <input id="topK" type="number" value="5" class="w-full bg-slate-950 border border-slate-700 rounded p-2 text-sm">
+            <label class="text-xs text-slate-400" for="temp">Temperature</label>
+            <input id="temp" type="number" min="0" max="2" step="0.1" value="0.2"
+              class="w-full bg-slate-950 border border-slate-700 rounded p-2 text-sm">
           </div>
         </div>
 
-        <button onclick="generateText()" id="btn" class="w-full bg-blue-600 hover:bg-blue-500 py-2.5 rounded-lg font-semibold transition">
-          Generate Continuation
+        <button onclick="generateText()" id="btn"
+          class="w-full bg-blue-600 hover:bg-blue-500 py-2.5 rounded-lg font-semibold">
+          Get Answer
         </button>
 
         <div>
-          <label class="block text-sm font-medium mb-1">Output</label>
-          <pre id="output" class="bg-slate-950 border border-slate-700 rounded-lg p-4 font-mono text-sm text-emerald-400 whitespace-pre-wrap min-h-[100px]">Waiting for generation...</pre>
+          <label class="block text-sm font-medium mb-1" for="output">Answer</label>
+          <pre id="output"
+            class="bg-slate-950 border border-slate-700 rounded-lg p-4 text-sm text-emerald-400 whitespace-pre-wrap min-h-[100px]">Your answer will appear here.</pre>
         </div>
       </div>
 
       <script>
         async function generateText() {
-          const btn = document.getElementById('btn');
-          const output = document.getElementById('output');
+          const btn = document.getElementById("btn");
+          const output = document.getElementById("output");
           btn.disabled = true;
-          btn.innerText = "Generating...";
-          output.innerText = "Processing tokens...";
+          btn.innerText = "Thinking...";
+          output.innerText = "Getting an answer...";
 
           try {
-            const res = await fetch('/generate', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+            const res = await fetch("/generate", {
+              method: "POST",
+              headers: {"Content-Type": "application/json"},
               body: JSON.stringify({
-                prompt: document.getElementById('prompt').value,
-                max_new_tokens: parseInt(document.getElementById('maxTokens').value),
-                temperature: parseFloat(document.getElementById('temp').value),
-                top_k: parseInt(document.getElementById('topK').value)
+                prompt: document.getElementById("prompt").value,
+                max_new_tokens: Number(document.getElementById("maxTokens").value),
+                temperature: Number(document.getElementById("temp").value)
               })
             });
+
             const data = await res.json();
+            if (!res.ok) {
+              throw new Error(data.detail || `Request failed (${res.status})`);
+            }
             output.innerText = data.generated_text;
           } catch (e) {
             output.innerText = "Error: " + e.message;
           } finally {
             btn.disabled = false;
-            btn.innerText = "Generate Continuation";
+            btn.innerText = "Get Answer";
           }
         }
       </script>
