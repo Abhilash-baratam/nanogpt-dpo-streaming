@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-=======
---extra-index-url https://download.pytorch.org/whl/cpu
->>>>>>> 941723f33fcc614e0c2e8a431b70cdadaa28b4f9
-torch
+
 fastapi
-uvicorn[standard]
-pydantic
+uvicorn
+python-dotenv
