@@ -1,22 +1,52 @@
-# Question Answering App
+Markdown
+# NanoGPT with Direct Preference Optimization (DPO) & Streaming Inference
 
-The FastAPI app sends questions to an OpenAI-compatible hosted chat-completions
-API. The local NanoGPT checkpoints are not used by this app; they were trained
-on Shakespeare and are not suitable for general question answering.
+A lightweight, modular reproduction of a decoder-only Transformer based on Karpathy's `nanoGPT` architecture, extended with Direct Preference Optimization (DPO) alignment and real-time SSE (Server-Sent Events) token streaming.
 
-## Run locally on Windows
+## Overview
+* **Architecture:** Decoder-only Transformer with multi-head self-attention, rotary embeddings (or learned positional embeddings), and residual normalization.
+* **Alignment Pipeline:** Fine-tuned via Direct Preference Optimization (DPO) on pairwise preference datasets without requiring a separate reinforcement learning reward model.
+* **Inference Engine:** Low-latency token generation with asynchronous streaming support for client-side consumption.
 
-In PowerShell, set your API key for the current terminal session and start the
-server:
+## Key Features
+* Custom autoregressive Transformer training loop in PyTorch.
+* DPO loss implementation with dynamic implicit reward margin calculation.
+* Asynchronous token streaming API endpoint for real-time response generation.
+* Mixed precision (`torch.cuda.amp`) training and gradient accumulation support.
 
-```powershell
-$env:OPENAI_API_KEY = "your-api-key"
-python -m uvicorn app:app --host 127.0.0.1 --port 8000
-```
+## Getting Started
 
-Open <http://127.0.0.1:8000>.
+### Prerequisites
+* Python 3.10+
+* NVIDIA GPU with CUDA support (recommended)
 
-The default provider URL is `https://api.openai.com/v1` and the default model is
-`gpt-4o-mini`. To use another OpenAI-compatible provider or model, set
-`OPENAI_BASE_URL` and `OPENAI_MODEL` before starting the server. Keep the API
-key in the server environment; do not put it in browser code or commit it.
+### Installation
+1. Clone the repository:
+   ```bash
+   git clone [https://github.com/Abhilash-baratam/nanogpt-dpo-streaming.git](https://github.com/Abhilash-baratam/nanogpt-dpo-streaming.git)
+   cd nanogpt-dpo-streaming
+   
+Create and activate a virtual environment:
+
+Bash
+
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+Install dependencies:
+
+Bash
+pip install -r requirements.txt
+Training & Fine-Tuning
+
+Pretrain / SFT:
+
+Bash
+python train.py --config=config/train_gpt.py
+Run DPO Alignment:
+
+Bash
+python dpo_train.py --config=config/dpo_config.py
+Running Inference & Streaming Server
+Bash
+python serve.py --port 8000
